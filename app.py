@@ -24,14 +24,25 @@ def get_connection():
     return conn
 
 
+ALLOWED_HOURS = {1, 3, 24}
+
+
 # Obtener datos
-def get_data():
-    """Consulta todos los registros de la tabla logs."""
-    query = "SELECT * FROM logs"
+def get_data(hours: int = 24) -> pd.DataFrame:
+    """Consulta los registros de la tabla logs dentro de la ventana de tiempo indicada (en horas)."""
+    if hours not in ALLOWED_HOURS:
+        hours = 24
+    query = """
+        SELECT id, ts, ingested_at, svc, url, http_method, status_code, log, duration
+        FROM logs
+        WHERE ts >= now() - (%s * interval '1 hour')
+        ORDER BY ts ASC
+    """
     with get_connection() as conn:
-        df = pd.read_sql(query, conn)
+        df = pd.read_sql(query, conn, params=(hours,))
     return df
 
+#Limpieza de datos
 def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     """Inspecciona y limpia el DataFrame recibido (función pipeline df -> df)."""
     df = df.copy()
@@ -45,7 +56,7 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     df.info()
     return df
 
-
+# Conteo de errores
 def count_errors(df: pd.DataFrame) -> pd.DataFrame:
     """Agrega banderas y conteos acumulados de errores 4xx y 5xx (función pipeline df -> df)."""
     df = df.copy()
@@ -61,7 +72,7 @@ def count_errors(df: pd.DataFrame) -> pd.DataFrame:
     df["error_5xx_count"] = df["is_5xx"].cumsum()
     return df
 
-
+# Métricas de tiempo de respuesta
 def add_response_time_metrics(df: pd.DataFrame) -> pd.DataFrame:
     """Agrega métricas derivadas del tiempo de respuesta en ms (función pipeline df -> df)."""
     df = df.copy()
@@ -72,7 +83,7 @@ def add_response_time_metrics(df: pd.DataFrame) -> pd.DataFrame:
         df["duration_rolling_avg"] = pd.NA
     return df
 
-
+# Construcción de resúmenes y gráficos
 def build_error_summary(df: pd.DataFrame) -> pd.DataFrame:
     """Construye un DataFrame resumen con el conteo total de errores 4xx y 5xx."""
     count_4xx = int(df["is_4xx"].sum()) if "is_4xx" in df.columns else 0
@@ -82,23 +93,91 @@ def build_error_summary(df: pd.DataFrame) -> pd.DataFrame:
         "cantidad": [count_4xx, count_5xx],
     })
 
+# Filtro por servicio (función pipeline df -> df)
+def filter_by_service(df: pd.DataFrame, service: str | None = None) -> pd.DataFrame:
+    """Filtra el DataFrame por servicio (svc) si se selecciona uno específico."""
+    df = df.copy()
+    if not service or service == "ALL" or "svc" not in df.columns:
+        return df
+    return df[df["svc"] == service].reset_index(drop=True)
 
+
+def build_service_options(df: pd.DataFrame) -> list[dict[str, str]]:
+    """Construye las opciones del dropdown de servicios a partir de la columna svc."""
+    options = [{"label": "Todos los servicios", "value": "ALL"}]
+    if "svc" in df.columns:
+        services = sorted(df["svc"].dropna().astype(str).unique())
+        options.extend({"label": svc, "value": svc} for svc in services)
+    return options
+
+
+# Construcción de resúmenes de tiempo de respuesta
 def build_response_time_summary(df: pd.DataFrame) -> dict[str, float]:
-    """Calcula estadísticas clave (promedio, P95 y máximo) del tiempo de respuesta en ms."""
+    """Calcula estadísticas clave (promedio, P95, P99 y máximo) del tiempo de respuesta en ms."""
     if "duration" not in df.columns:
-        return {"avg_ms": 0.0, "p95_ms": 0.0, "max_ms": 0.0}
+        return {"avg_ms": 0.0, "p95_ms": 0.0, "p99_ms": 0.0, "max_ms": 0.0}
 
     valid = pd.to_numeric(df["duration"], errors="coerce").dropna()
     if valid.empty:
-        return {"avg_ms": 0.0, "p95_ms": 0.0, "max_ms": 0.0}
+        return {"avg_ms": 0.0, "p95_ms": 0.0, "p99_ms": 0.0, "max_ms": 0.0}
 
     return {
         "avg_ms": float(valid.mean()),
         "p95_ms": float(valid.quantile(0.95)),
+        "p99_ms": float(valid.quantile(0.99)),
         "max_ms": float(valid.max()),
     }
 
 
+# Construcción de resúmenes y gráficos de Throughput (RPM)
+def build_throughput_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Agrupa las peticiones por minuto para calcular el Throughput (RPM)."""
+    if "ts" not in df.columns:
+        return pd.DataFrame(columns=["minuto", "rpm"])
+
+    ts = pd.to_datetime(df["ts"], errors="coerce").dropna()
+    if ts.empty:
+        return pd.DataFrame(columns=["minuto", "rpm"])
+
+    rpm_df = (
+        ts.dt.floor("min")
+        .value_counts()
+        .sort_index()
+        .rename_axis("minuto")
+        .reset_index(name="rpm")
+    )
+    return rpm_df
+
+
+def build_throughput_summary(df: pd.DataFrame) -> dict[str, float]:
+    """Calcula el Throughput promedio y pico en requests por minuto (RPM)."""
+    rpm_df = build_throughput_df(df)
+    if rpm_df.empty:
+        return {"avg_rpm": 0.0, "peak_rpm": 0.0}
+    return {
+        "avg_rpm": float(rpm_df["rpm"].mean()),
+        "peak_rpm": float(rpm_df["rpm"].max()),
+    }
+
+
+def build_throughput_figure(df: pd.DataFrame):
+    """Construye el gráfico de Throughput (requests por minuto)."""
+    rpm_df = build_throughput_df(df)
+    if rpm_df.empty:
+        return px.line(title="Throughput (RPM) (sin datos)")
+
+    fig = px.line(
+        rpm_df,
+        x="minuto",
+        y="rpm",
+        markers=True,
+        title="Throughput (Requests por Minuto - RPM)",
+        labels={"minuto": "Tiempo", "rpm": "Requests / min"},
+    )
+    fig.update_layout(xaxis_title="Tiempo", yaxis_title="Requests / min")
+    return fig
+
+# Construcción de gráficos
 def build_error_figure(error_summary: pd.DataFrame):
     """Construye el gráfico de barras de errores 4xx vs 5xx."""
     fig = px.bar(
@@ -116,7 +195,7 @@ def build_error_figure(error_summary: pd.DataFrame):
     fig.update_layout(showlegend=False, xaxis_title="Tipo de Error", yaxis_title="Cantidad")
     return fig
 
-
+# Construcción de gráfico de tiempo de respuesta
 def build_response_time_figure(df: pd.DataFrame):
     """Construye el gráfico de evolución del tiempo de respuesta (duration en ms)."""
     if "duration" not in df.columns or df["duration"].dropna().empty:
@@ -142,24 +221,26 @@ def build_response_time_figure(df: pd.DataFrame):
     )
     return fig
 
-
-def load_processed_data() -> pd.DataFrame:
+# Pipeline completo de carga y procesamiento de datos
+def load_processed_data(hours: int = 24) -> pd.DataFrame:
     """Ejecuta el pipeline completo de carga, limpieza, conteo de errores y tiempo de respuesta."""
     return (
-        get_data()
+        get_data(hours=hours)
         .pipe(clean_data)
         .pipe(count_errors)
         .pipe(add_response_time_metrics)
     )
 
 
-def create_app(df: pd.DataFrame, data_loader=load_processed_data) -> Dash:
+# Construcción de la aplicación Dash
+def create_app(df: pd.DataFrame, data_loader=load_processed_data, default_hours: int = 24) -> Dash:
     """Construye y configura la aplicación Dash."""
     app = Dash(__name__)
 
-    state = {"df": df}
+    state = {"df": df, "hours": default_hours}
     columns = list(df.columns)
     default_col = columns[0] if columns else None
+    service_options = build_service_options(df)
 
     error_summary = build_error_summary(df)
     count_4xx = int(error_summary.loc[0, "cantidad"])
@@ -169,6 +250,9 @@ def create_app(df: pd.DataFrame, data_loader=load_processed_data) -> Dash:
 
     resp_summary = build_response_time_summary(df)
     resp_fig = build_response_time_figure(df)
+
+    throughput_summary = build_throughput_summary(df)
+    throughput_fig = build_throughput_figure(df)
     initial_updated = f"Última actualización: {datetime.now().strftime('%H:%M:%S')}"
 
     card_style = {
@@ -193,7 +277,27 @@ def create_app(df: pd.DataFrame, data_loader=load_processed_data) -> Dash:
                 html.H1("Dashboard de Logs", style={"margin": "0"}),
                 html.Div(
                     [
-                        html.Label("Actualización automática:", style={"fontWeight": "bold"}),
+                        html.Label("Ventana:", style={"fontWeight": "bold"}),
+                        dcc.RadioItems(
+                            id="time-window-selector",
+                            options=[
+                                {"label": "1 h", "value": 1},
+                                {"label": "3 h", "value": 3},
+                                {"label": "24 h", "value": 24},
+                            ],
+                            value=default_hours,
+                            inline=True,
+                            style={"display": "flex", "gap": "10px"},
+                        ),
+                        html.Label("Servicio:", style={"fontWeight": "bold"}),
+                        dcc.Dropdown(
+                            id="service-filter",
+                            options=service_options,
+                            value="ALL",
+                            clearable=False,
+                            style={"minWidth": "200px"},
+                        ),
+                        html.Label("Auto-refresh:", style={"fontWeight": "bold"}),
                         dcc.RadioItems(
                             id="refresh-interval-selector",
                             options=[
@@ -203,7 +307,7 @@ def create_app(df: pd.DataFrame, data_loader=load_processed_data) -> Dash:
                             ],
                             value=10_000,
                             inline=True,
-                            style={"display": "flex", "gap": "12px"},
+                            style={"display": "flex", "gap": "10px"},
                         ),
                         html.Span(
                             initial_updated,
@@ -225,6 +329,13 @@ def create_app(df: pd.DataFrame, data_loader=load_processed_data) -> Dash:
         ),
         html.Div(
             [
+                html.Div(
+                    [
+                        html.H3("Throughput", style={"margin": "0", "color": "#0284c7"}),
+                        html.P(f"{throughput_summary['avg_rpm']:.1f} RPM", id="throughput-rpm", style={"fontSize": "28px", "fontWeight": "bold", "margin": "8px 0 0"}),
+                    ],
+                    style=card_style,
+                ),
                 html.Div(
                     [
                         html.H3("Errores 4xx", style={"margin": "0", "color": "#d97706"}),
@@ -262,6 +373,13 @@ def create_app(df: pd.DataFrame, data_loader=load_processed_data) -> Dash:
                 ),
                 html.Div(
                     [
+                        html.H3("Resp. P99", style={"margin": "0", "color": "#9333ea"}),
+                        html.P(f"{resp_summary['p99_ms']:.1f} ms", id="resp-p99-ms", style={"fontSize": "28px", "fontWeight": "bold", "margin": "8px 0 0"}),
+                    ],
+                    style=card_style,
+                ),
+                html.Div(
+                    [
                         html.H3("Resp. Máx", style={"margin": "0", "color": "#0f766e"}),
                         html.P(f"{resp_summary['max_ms']:.0f} ms", id="resp-max-ms", style={"fontSize": "28px", "fontWeight": "bold", "margin": "8px 0 0"}),
                     ],
@@ -270,6 +388,7 @@ def create_app(df: pd.DataFrame, data_loader=load_processed_data) -> Dash:
             ],
             style={"display": "flex", "gap": "16px", "marginBottom": "24px", "flexWrap": "wrap"},
         ),
+        dcc.Graph(id="throughput-graph", figure=throughput_fig),
         dcc.Graph(id="error-count-graph", figure=error_fig),
         dcc.Graph(id="response-time-graph", figure=resp_fig),
         dcc.Graph(id="log-graph"),
@@ -291,30 +410,54 @@ def create_app(df: pd.DataFrame, data_loader=load_processed_data) -> Dash:
             return 10_000, True
         return int(selected_interval), False
 
-    # Callback para refrescar datos automáticamente y actualizar gráficos/KPIs
+    # Callback para refrescar datos, filtrar por ventana/servicio y actualizar gráficos/KPIs
     @app.callback(
+        Output("throughput-rpm", "children"),
         Output("error-4xx-total", "children"),
         Output("error-5xx-total", "children"),
         Output("error-total", "children"),
         Output("resp-avg-ms", "children"),
         Output("resp-p95-ms", "children"),
+        Output("resp-p99-ms", "children"),
         Output("resp-max-ms", "children"),
+        Output("throughput-graph", "figure"),
         Output("error-count-graph", "figure"),
         Output("response-time-graph", "figure"),
         Output("log-graph", "figure"),
+        Output("service-filter", "options"),
         Output("last-updated", "children"),
         Input("auto-refresh-interval", "n_intervals"),
+        Input("time-window-selector", "value"),
+        Input("service-filter", "value"),
         Input("log-dropdown", "value"),
     )
-    def update_dashboard(n_intervals, selected_column):
+    def update_dashboard(n_intervals, selected_hours, selected_service, selected_column):
+        hours = int(selected_hours) if selected_hours in ALLOWED_HOURS else default_hours
         status_text = f"Última actualización: {datetime.now().strftime('%H:%M:%S')}"
-        if ctx.triggered_id == "auto-refresh-interval" and n_intervals > 0:
+
+        should_reload = (
+            (ctx.triggered_id == "auto-refresh-interval" and n_intervals > 0)
+            or (ctx.triggered_id == "time-window-selector" and hours != state["hours"])
+        )
+        if should_reload:
             try:
-                state["df"] = data_loader()
+                state["df"] = data_loader(hours)
+                state["hours"] = hours
             except Exception as exc:
                 status_text = f"Error al actualizar ({datetime.now().strftime('%H:%M:%S')}): {exc}"
 
-        current_df = state["df"]
+        base_df = state["df"]
+        svc_options = build_service_options(base_df)
+        current_df = (
+            base_df
+            .pipe(filter_by_service, selected_service)
+            .pipe(count_errors)
+            .pipe(add_response_time_metrics)
+        )
+
+        t_summary = build_throughput_summary(current_df)
+        t_fig = build_throughput_figure(current_df)
+
         summary = build_error_summary(current_df)
         c4xx = int(summary.loc[0, "cantidad"])
         c5xx = int(summary.loc[1, "cantidad"])
@@ -335,15 +478,19 @@ def create_app(df: pd.DataFrame, data_loader=load_processed_data) -> Dash:
             )
 
         return (
+            f"{t_summary['avg_rpm']:.1f} RPM",
             str(c4xx),
             str(c5xx),
             str(total),
             f"{r_summary['avg_ms']:.1f} ms",
             f"{r_summary['p95_ms']:.1f} ms",
+            f"{r_summary['p99_ms']:.1f} ms",
             f"{r_summary['max_ms']:.0f} ms",
+            t_fig,
             err_fig,
             r_fig,
             line_fig,
+            svc_options,
             status_text,
         )
 
@@ -351,8 +498,9 @@ def create_app(df: pd.DataFrame, data_loader=load_processed_data) -> Dash:
 
 
 def main():
-    df = load_processed_data()
-    app = create_app(df)
+    default_hours = 24
+    df = load_processed_data(hours=default_hours)
+    app = create_app(df, default_hours=default_hours)
     app.run(debug=True)
     return df
 
