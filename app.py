@@ -1,6 +1,9 @@
 # App
 ## Importación de librerías
 
+from __future__ import annotations
+
+import logging
 import os
 from datetime import datetime
 import pandas as pd
@@ -9,8 +12,16 @@ import psycopg
 from dash import Dash, dcc, html, Input, Output, ctx
 from dotenv import load_dotenv
 
-# Carga de variables de entorno
+# Configuración de logging y variables de entorno
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
 load_dotenv()
+
+ALLOWED_HOURS = {1, 3, 24}
+BUCKET_BY_HOURS = {1: "1min", 3: "3min", 24: "10min"}
 
 
 def get_connection():
@@ -20,11 +31,8 @@ def get_connection():
         raise ValueError("La variable de entorno 'pstgrl' no está definida.")
 
     conn = psycopg.connect(db_url)
-    print("¡Conexión exitosa a PostgreSQL!")
+    logger.debug("Conexión exitosa a PostgreSQL")
     return conn
-
-
-ALLOWED_HOURS = {1, 3, 24}
 
 
 # Obtener datos
@@ -35,16 +43,21 @@ def get_data(hours: int = 24) -> pd.DataFrame:
     query = """
         SELECT id, ts, ingested_at, svc, url, http_method, status_code, log, duration
         FROM logs
-        WHERE ts >= now() - (%s * interval '1 hour')
+        WHERE ts >= (SELECT max(ts) FROM logs) - make_interval(hours => %s::int)
         ORDER BY ts ASC
     """
     with get_connection() as conn:
-        df = pd.read_sql(query, conn, params=(hours,))
+        with conn.cursor() as cur:
+            cur.execute(query, (hours,))
+            rows = cur.fetchall()
+            columns = [desc.name for desc in cur.description]
+    df = pd.DataFrame(rows, columns=columns)
+    logger.debug("Cargados %d registros de logs (ventana: %dh)", len(df), hours)
     return df
 
-#Limpieza de datos
+# Limpieza de datos
 def clean_data(df: pd.DataFrame) -> pd.DataFrame:
-    """Inspecciona y limpia el DataFrame recibido (función pipeline df -> df)."""
+    """Limpia y tipifica el DataFrame recibido (función pipeline df -> df)."""
     df = df.copy()
     if "status_code" in df.columns:
         df["status_code"] = pd.to_numeric(df["status_code"], errors="coerce")
@@ -53,7 +66,7 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     if "ts" in df.columns:
         df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
         df = df.sort_values("ts").reset_index(drop=True)
-    df.info()
+    logger.debug("DataFrame procesado: %d filas, %d columnas", len(df), len(df.columns))
     return df
 
 # Conteo de errores
@@ -131,7 +144,7 @@ def build_response_time_summary(df: pd.DataFrame) -> dict[str, float]:
 
 # Construcción de resúmenes y gráficos de Throughput (RPM)
 def build_throughput_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Agrupa las peticiones por minuto para calcular el Throughput (RPM)."""
+    """Agrupa las peticiones por minuto rellenando con 0 los minutos sin tráfico."""
     if "ts" not in df.columns:
         return pd.DataFrame(columns=["minuto", "rpm"])
 
@@ -139,10 +152,10 @@ def build_throughput_df(df: pd.DataFrame) -> pd.DataFrame:
     if ts.empty:
         return pd.DataFrame(columns=["minuto", "rpm"])
 
+    counts = ts.dt.floor("min").value_counts().sort_index()
+    full_range = pd.date_range(start=counts.index.min(), end=counts.index.max(), freq="1min")
     rpm_df = (
-        ts.dt.floor("min")
-        .value_counts()
-        .sort_index()
+        counts.reindex(full_range, fill_value=0)
         .rename_axis("minuto")
         .reset_index(name="rpm")
     )
@@ -160,22 +173,58 @@ def build_throughput_summary(df: pd.DataFrame) -> dict[str, float]:
     }
 
 
+def apply_chart_theme(fig, *, height: int = 360, hovermode: str = "x unified"):
+    """Aplica un estilo visual uniforme y limpio a los gráficos Plotly."""
+    fig.update_layout(
+        template="plotly_white",
+        height=height,
+        hovermode=hovermode,
+        hoverlabel=dict(
+            bgcolor="rgba(255, 255, 255, 0.96)",
+            bordercolor="#cbd5e1",
+            font=dict(family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif", size=12, color="#0f172a"),
+        ),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif", color="#1e293b", size=12),
+        title=dict(font=dict(size=16, color="#0f172a"), x=0.01, xanchor="left"),
+        margin=dict(l=52, r=20, t=58, b=44),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, title_text=""),
+    )
+    fig.update_xaxes(showgrid=False, linecolor="#e2e8f0", tickfont=dict(color="#64748b"))
+    fig.update_yaxes(gridcolor="#f1f5f9", zerolinecolor="#e2e8f0", tickfont=dict(color="#64748b"))
+    return fig
+
+
+def build_kpi_card(title: str, value: str, value_id: str, title_color: str) -> html.Div:
+    """Construye una tarjeta KPI compacta con título de color, valor oscuro y efecto hover."""
+    return html.Div(
+        [
+            html.H3(title, className="kpi-title", style={"color": title_color}),
+            html.P(value, id=value_id, className="kpi-value"),
+        ],
+        className="kpi-card",
+    )
+
+
 def build_throughput_figure(df: pd.DataFrame):
-    """Construye el gráfico de Throughput (requests por minuto)."""
+    """Construye el gráfico de Throughput (requests por minuto) con 0 en minutos sin tráfico."""
     rpm_df = build_throughput_df(df)
     if rpm_df.empty:
-        return px.line(title="Throughput (RPM) (sin datos)")
+        return apply_chart_theme(px.line(title="Throughput (RPM) — Sin datos"))
 
-    fig = px.line(
+    fig = px.area(
         rpm_df,
         x="minuto",
         y="rpm",
         markers=True,
-        title="Throughput (Requests por Minuto - RPM)",
+        title="Throughput (Requests por Minuto)",
         labels={"minuto": "Tiempo", "rpm": "Requests / min"},
+        color_discrete_sequence=["#0284c7"],
     )
+    fig.update_traces(line=dict(width=2.5), fillcolor="rgba(2, 132, 199, 0.12)")
     fig.update_layout(xaxis_title="Tiempo", yaxis_title="Requests / min")
-    return fig
+    return apply_chart_theme(fig)
 
 # Construcción de gráficos
 def build_error_figure(error_summary: pd.DataFrame):
@@ -192,34 +241,165 @@ def build_error_figure(error_summary: pd.DataFrame):
             "5xx (Servidor)": "#ef4444",
         },
     )
-    fig.update_layout(showlegend=False, xaxis_title="Tipo de Error", yaxis_title="Cantidad")
-    return fig
+    fig.update_traces(textposition="outside", marker_line_width=0, width=0.45)
+    fig.update_layout(showlegend=False, xaxis_title="", yaxis_title="Cantidad")
+    return apply_chart_theme(fig, hovermode="closest")
+
+def fill_short_gaps(series: pd.Series, max_gap: int = 3) -> pd.Series:
+    """Interpola los huecos de hasta `max_gap` intervalos seguidos; los huecos más largos quedan vacíos."""
+    filled = series.interpolate(limit_area="inside")
+    is_na = series.isna()
+    run_id = (is_na != is_na.shift()).cumsum()
+    run_len = is_na.groupby(run_id).transform("sum")
+    return filled.mask(is_na & (run_len > max_gap))
+
 
 # Construcción de gráfico de tiempo de respuesta
-def build_response_time_figure(df: pd.DataFrame):
-    """Construye el gráfico de evolución del tiempo de respuesta (duration en ms)."""
+def build_response_time_figure(df: pd.DataFrame, hours: int = 24):
+    """Promedia el tiempo de respuesta por servicio en buckets de 1, 3 o 10 min dejando huecos largos vacíos."""
+    freq = BUCKET_BY_HOURS.get(hours, "10min")
     if "duration" not in df.columns or df["duration"].dropna().empty:
-        return px.line(title="Tiempo de Respuesta (sin datos)")
+        return apply_chart_theme(px.line(title=f"Tiempo de Respuesta ({freq}) — Sin datos"))
 
-    x_col = "ts" if "ts" in df.columns and not df["ts"].dropna().empty else None
-    color_col = "svc" if "svc" in df.columns else None
+    if "ts" not in df.columns or df["ts"].dropna().empty:
+        return apply_chart_theme(px.line(title=f"Tiempo de Respuesta ({freq}) — Sin datos"))
+
+    work = df.copy()
+    work["ts"] = pd.to_datetime(work["ts"], errors="coerce")
+    work["duration"] = pd.to_numeric(work["duration"], errors="coerce")
+    work = work.dropna(subset=["ts", "duration"])
+    if work.empty:
+        return apply_chart_theme(px.line(title=f"Tiempo de Respuesta ({freq}) — Sin datos"))
+
+    work["bucket"] = work["ts"].dt.floor(freq)
+    full_buckets = pd.date_range(start=work["bucket"].min(), end=work["bucket"].max(), freq=freq)
+
+    if "svc" in work.columns and not work["svc"].dropna().empty:
+        grouped = work.groupby(["svc", "bucket"], as_index=False)["duration"].mean()
+        services = sorted(grouped["svc"].unique())
+        frames = []
+        for svc in services:
+            svc_series = (
+                grouped[grouped["svc"] == svc]
+                .set_index("bucket")["duration"]
+                .reindex(full_buckets)
+                .pipe(fill_short_gaps, max_gap=2)
+                .rename_axis("bucket")
+                .reset_index()
+            )
+            svc_series["svc"] = svc
+            frames.append(svc_series)
+        agg_df = pd.concat(frames, ignore_index=True)
+        color_col = "svc"
+    else:
+        agg_df = (
+            work.groupby("bucket")["duration"]
+            .mean()
+            .reindex(full_buckets)
+            .pipe(fill_short_gaps, max_gap=2)
+            .rename_axis("bucket")
+            .reset_index()
+        )
+        color_col = None
+
     fig = px.line(
-        df,
-        x=x_col if x_col else df.index,
+        agg_df,
+        x="bucket",
         y="duration",
         color=color_col,
-        title="Tiempo de Respuesta (ms)",
+        line_shape="spline",
+        title=f"Tiempo de Respuesta Promedio por Servicio (cada {freq})",
         labels={
-            "ts": "Tiempo",
-            "duration": "Duración (ms)",
+            "bucket": "Tiempo",
+            "duration": "Duración promedio (ms)",
             "svc": "Servicio",
         },
+        color_discrete_sequence=["#2563eb", "#7c3aed", "#0d9488", "#ea580c", "#db2777"],
     )
+    if color_col:
+        fig.update_traces(
+            line=dict(width=2, smoothing=0.6),
+            connectgaps=False,
+            hovertemplate="%{fullData.name}: <b>%{y:.1f} ms</b><extra></extra>",
+        )
+    else:
+        fig.update_traces(
+            line=dict(width=2.2, smoothing=0.6),
+            connectgaps=False,
+            hovertemplate="Promedio: <b>%{y:.1f} ms</b><extra></extra>",
+        )
     fig.update_layout(
-        xaxis_title="Tiempo" if x_col else "Registro",
-        yaxis_title="Duración (ms)",
+        xaxis_title="Tiempo",
+        yaxis_title="Duración promedio (ms)",
     )
-    return fig
+    fig.update_yaxes(rangemode="tozero")
+    return apply_chart_theme(fig, height=380)
+
+
+def build_column_figure(df: pd.DataFrame, column: str | None, hours: int = 24):
+    """Gráfico del explorador de métricas (status_code o duration), agrupado por intervalos de tiempo."""
+    freq = BUCKET_BY_HOURS.get(hours, "10min")
+    empty = apply_chart_theme(px.line(title="Sin datos para mostrar"), height=340)
+    if not column or column not in df.columns or df.empty or "ts" not in df.columns:
+        return empty
+
+    work = df[["ts", column]].copy()
+    work["ts"] = pd.to_datetime(work["ts"], errors="coerce")
+    work[column] = pd.to_numeric(work[column], errors="coerce")
+    work = work.dropna(subset=["ts", column])
+    if work.empty:
+        return empty
+    work["bucket"] = work["ts"].dt.floor(freq)
+
+    if column == "status_code":
+        work["clase"] = (work["status_code"] // 100).astype(int).astype(str) + "xx"
+        counts = work.groupby(["bucket", "clase"], as_index=False).size().rename(columns={"size": "requests"})
+        fig = px.bar(
+            counts,
+            x="bucket",
+            y="requests",
+            color="clase",
+            title=f"Requests por Código de Estado (cada {freq})",
+            labels={"bucket": "Tiempo", "requests": "Requests", "clase": "Código"},
+            category_orders={"clase": ["2xx", "3xx", "4xx", "5xx"]},
+            color_discrete_map={"2xx": "#10b981", "3xx": "#0284c7", "4xx": "#f59e0b", "5xx": "#ef4444"},
+        )
+        fig.update_traces(
+            marker_line_width=0,
+            hovertemplate="%{fullData.name}: <b>%{y} req</b><extra></extra>",
+        )
+        fig.update_layout(barmode="stack", bargap=0.15, xaxis_title="Tiempo", yaxis_title="Requests")
+        return apply_chart_theme(fig, height=340)
+
+    agg = "max" if column.endswith("_count") else "mean"
+    series = work.groupby("bucket")[column].agg(agg)
+    full_buckets = pd.date_range(start=series.index.min(), end=series.index.max(), freq=freq)
+    series = series.reindex(full_buckets).pipe(fill_short_gaps).rename_axis("bucket").reset_index()
+
+    is_duration = column == "duration"
+    y_label = "Duración promedio (ms)" if is_duration else column
+    title = f"Duración Promedio General (cada {freq})" if is_duration else f"Serie de {column} (cada {freq})"
+    hover_tpl = "Duración promedio: <b>%{y:.1f} ms</b><extra></extra>" if is_duration else f"{column}: <b>%{{y:.1f}}</b><extra></extra>"
+
+    fig = px.area(
+        series,
+        x="bucket",
+        y=column,
+        line_shape="spline",
+        title=title,
+        labels={"bucket": "Tiempo", column: y_label},
+        color_discrete_sequence=["#2563eb"],
+    )
+    fig.update_traces(
+        line=dict(width=2.2, smoothing=0.6),
+        fillcolor="rgba(37, 99, 235, 0.10)",
+        connectgaps=False,
+        hovertemplate=hover_tpl,
+    )
+    fig.update_layout(xaxis_title="Tiempo", yaxis_title=y_label)
+    fig.update_yaxes(rangemode="tozero")
+    return apply_chart_theme(fig, height=340)
+
 
 # Pipeline completo de carga y procesamiento de datos
 def load_processed_data(hours: int = 24) -> pd.DataFrame:
@@ -234,170 +414,149 @@ def load_processed_data(hours: int = 24) -> pd.DataFrame:
 
 # Construcción de la aplicación Dash
 def create_app(df: pd.DataFrame, data_loader=load_processed_data, default_hours: int = 24) -> Dash:
-    """Construye y configura la aplicación Dash."""
+    """Construye y configura la aplicación Dash; el callback inicial llena KPIs y gráficos."""
     app = Dash(__name__)
 
     state = {"df": df, "hours": default_hours}
-    columns = list(df.columns)
-    default_col = columns[0] if columns else None
+    allowed_explorer_cols = ("status_code", "duration")
+    explorer_columns = [col for col in allowed_explorer_cols if col in df.columns] or list(allowed_explorer_cols)
+    default_col = explorer_columns[0]
     service_options = build_service_options(df)
 
-    error_summary = build_error_summary(df)
-    count_4xx = int(error_summary.loc[0, "cantidad"])
-    count_5xx = int(error_summary.loc[1, "cantidad"])
-    total_errors = count_4xx + count_5xx
-    error_fig = build_error_figure(error_summary)
-
-    resp_summary = build_response_time_summary(df)
-    resp_fig = build_response_time_figure(df)
-
-    throughput_summary = build_throughput_summary(df)
-    throughput_fig = build_throughput_figure(df)
-    initial_updated = f"Última actualización: {datetime.now().strftime('%H:%M:%S')}"
-
-    card_style = {
-        "border": "1px solid #e5e7eb",
-        "borderRadius": "8px",
-        "padding": "16px 24px",
-        "minWidth": "160px",
-        "textAlign": "center",
-        "boxShadow": "0 1px 3px rgba(0, 0, 0, 0.1)",
-    }
-
     # Layout de la aplicación
-    app.layout = html.Div([
-        dcc.Interval(
-            id="auto-refresh-interval",
-            interval=10_000,
-            n_intervals=0,
-            disabled=False,
-        ),
-        html.Div(
-            [
-                html.H1("Dashboard de Logs", style={"margin": "0"}),
-                html.Div(
-                    [
-                        html.Label("Ventana:", style={"fontWeight": "bold"}),
-                        dcc.RadioItems(
-                            id="time-window-selector",
-                            options=[
-                                {"label": "1 h", "value": 1},
-                                {"label": "3 h", "value": 3},
-                                {"label": "24 h", "value": 24},
-                            ],
-                            value=default_hours,
-                            inline=True,
-                            style={"display": "flex", "gap": "10px"},
-                        ),
-                        html.Label("Servicio:", style={"fontWeight": "bold"}),
-                        dcc.Dropdown(
-                            id="service-filter",
-                            options=service_options,
-                            value="ALL",
-                            clearable=False,
-                            style={"minWidth": "200px"},
-                        ),
-                        html.Label("Auto-refresh:", style={"fontWeight": "bold"}),
-                        dcc.RadioItems(
-                            id="refresh-interval-selector",
-                            options=[
-                                {"label": "10s", "value": 10_000},
-                                {"label": "60s", "value": 60_000},
-                                {"label": "Pausado", "value": 0},
-                            ],
-                            value=10_000,
-                            inline=True,
-                            style={"display": "flex", "gap": "10px"},
-                        ),
-                        html.Span(
-                            initial_updated,
-                            id="last-updated",
-                            style={"color": "#6b7280", "fontSize": "14px"},
-                        ),
-                    ],
-                    style={"display": "flex", "alignItems": "center", "gap": "16px", "flexWrap": "wrap"},
-                ),
-            ],
-            style={
-                "display": "flex",
-                "justifyContent": "space-between",
-                "alignItems": "center",
-                "flexWrap": "wrap",
-                "gap": "16px",
-                "marginBottom": "20px",
-            },
-        ),
-        html.Div(
-            [
-                html.Div(
-                    [
-                        html.H3("Throughput", style={"margin": "0", "color": "#0284c7"}),
-                        html.P(f"{throughput_summary['avg_rpm']:.1f} RPM", id="throughput-rpm", style={"fontSize": "28px", "fontWeight": "bold", "margin": "8px 0 0"}),
-                    ],
-                    style=card_style,
-                ),
-                html.Div(
-                    [
-                        html.H3("Errores 4xx", style={"margin": "0", "color": "#d97706"}),
-                        html.P(str(count_4xx), id="error-4xx-total", style={"fontSize": "28px", "fontWeight": "bold", "margin": "8px 0 0"}),
-                    ],
-                    style=card_style,
-                ),
-                html.Div(
-                    [
-                        html.H3("Errores 5xx", style={"margin": "0", "color": "#dc2626"}),
-                        html.P(str(count_5xx), id="error-5xx-total", style={"fontSize": "28px", "fontWeight": "bold", "margin": "8px 0 0"}),
-                    ],
-                    style=card_style,
-                ),
-                html.Div(
-                    [
-                        html.H3("Total Errores", style={"margin": "0", "color": "#374151"}),
-                        html.P(str(total_errors), id="error-total", style={"fontSize": "28px", "fontWeight": "bold", "margin": "8px 0 0"}),
-                    ],
-                    style=card_style,
-                ),
-                html.Div(
-                    [
-                        html.H3("Resp. Promedio", style={"margin": "0", "color": "#2563eb"}),
-                        html.P(f"{resp_summary['avg_ms']:.1f} ms", id="resp-avg-ms", style={"fontSize": "28px", "fontWeight": "bold", "margin": "8px 0 0"}),
-                    ],
-                    style=card_style,
-                ),
-                html.Div(
-                    [
-                        html.H3("Resp. P95", style={"margin": "0", "color": "#7c3aed"}),
-                        html.P(f"{resp_summary['p95_ms']:.1f} ms", id="resp-p95-ms", style={"fontSize": "28px", "fontWeight": "bold", "margin": "8px 0 0"}),
-                    ],
-                    style=card_style,
-                ),
-                html.Div(
-                    [
-                        html.H3("Resp. P99", style={"margin": "0", "color": "#9333ea"}),
-                        html.P(f"{resp_summary['p99_ms']:.1f} ms", id="resp-p99-ms", style={"fontSize": "28px", "fontWeight": "bold", "margin": "8px 0 0"}),
-                    ],
-                    style=card_style,
-                ),
-                html.Div(
-                    [
-                        html.H3("Resp. Máx", style={"margin": "0", "color": "#0f766e"}),
-                        html.P(f"{resp_summary['max_ms']:.0f} ms", id="resp-max-ms", style={"fontSize": "28px", "fontWeight": "bold", "margin": "8px 0 0"}),
-                    ],
-                    style=card_style,
-                ),
-            ],
-            style={"display": "flex", "gap": "16px", "marginBottom": "24px", "flexWrap": "wrap"},
-        ),
-        dcc.Graph(id="throughput-graph", figure=throughput_fig),
-        dcc.Graph(id="error-count-graph", figure=error_fig),
-        dcc.Graph(id="response-time-graph", figure=resp_fig),
-        dcc.Graph(id="log-graph"),
-        dcc.Dropdown(
-            id="log-dropdown",
-            options=[{"label": col, "value": col} for col in columns],
-            value=default_col,
-        ),
-    ], style={"padding": "24px", "fontFamily": "sans-serif"})
+    app.layout = html.Div(
+        [
+            dcc.Interval(
+                id="auto-refresh-interval",
+                interval=10_000,
+                n_intervals=0,
+                disabled=False,
+            ),
+            html.Header(
+                [
+                    html.Div(
+                        [
+                            html.H1("Dashboard de Logs", className="dashboard-title"),
+                            html.P(
+                                "Monitoreo en tiempo real de tráfico, errores HTTP y latencia por servicio",
+                                className="dashboard-subtitle",
+                            ),
+                        ]
+                    ),
+                    html.Div(
+                        [
+                            html.Span(className="status-dot"),
+                            html.Span("Cargando...", id="last-updated"),
+                        ],
+                        className="status-badge",
+                    ),
+                ],
+                className="dashboard-header",
+            ),
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Span("Ventana", className="control-label"),
+                            dcc.RadioItems(
+                                id="time-window-selector",
+                                options=[
+                                    {"label": "1 h", "value": 1},
+                                    {"label": "3 h", "value": 3},
+                                    {"label": "24 h", "value": 24},
+                                ],
+                                value=default_hours,
+                                inline=True,
+                                className="pill-radio",
+                            ),
+                        ],
+                        className="control-group",
+                    ),
+                    html.Div(
+                        [
+                            html.Span("Servicio", className="control-label"),
+                            dcc.Dropdown(
+                                id="service-filter",
+                                options=service_options,
+                                value="ALL",
+                                clearable=False,
+                                className="service-dropdown",
+                            ),
+                        ],
+                        className="control-group",
+                    ),
+                    html.Div(
+                        [
+                            html.Span("Auto-refresh", className="control-label"),
+                            dcc.RadioItems(
+                                id="refresh-interval-selector",
+                                options=[
+                                    {"label": "10s", "value": 10_000},
+                                    {"label": "60s", "value": 60_000},
+                                    {"label": "Pausado", "value": 0},
+                                ],
+                                value=10_000,
+                                inline=True,
+                                className="pill-radio",
+                            ),
+                        ],
+                        className="control-group",
+                    ),
+                ],
+                className="toolbar-card",
+            ),
+            html.Div(
+                [
+                    build_kpi_card("Throughput", "—", "throughput-rpm", "#0284c7"),
+                    build_kpi_card("Errores 4xx", "—", "error-4xx-total", "#d97706"),
+                    build_kpi_card("Errores 5xx", "—", "error-5xx-total", "#dc2626"),
+                    build_kpi_card("Total Errores", "—", "error-total", "#374151"),
+                    build_kpi_card("Resp. Promedio", "—", "resp-avg-ms", "#2563eb"),
+                    build_kpi_card("Resp. P95", "—", "resp-p95-ms", "#7c3aed"),
+                    build_kpi_card("Resp. P99", "—", "resp-p99-ms", "#9333ea"),
+                    build_kpi_card("Resp. Máx", "—", "resp-max-ms", "#0f766e"),
+                ],
+                className="kpi-grid",
+            ),
+            html.Div(
+                [
+                    html.Div(
+                        dcc.Graph(id="throughput-graph", config={"displayModeBar": False}),
+                        className="chart-card",
+                    ),
+                    html.Div(
+                        dcc.Graph(id="error-count-graph", config={"displayModeBar": False}),
+                        className="chart-card",
+                    ),
+                ],
+                className="charts-grid-two",
+            ),
+            html.Div(
+                dcc.Graph(id="response-time-graph", config={"displayModeBar": False}),
+                className="chart-card",
+            ),
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.H3("Explorador de Métricas", className="explorer-title"),
+                            dcc.Dropdown(
+                                id="log-dropdown",
+                                options=[{"label": col, "value": col} for col in explorer_columns],
+                                value=default_col,
+                                clearable=False,
+                                className="explorer-dropdown",
+                            ),
+                        ],
+                        className="explorer-header",
+                    ),
+                    dcc.Graph(id="log-graph", config={"displayModeBar": False}),
+                ],
+                className="chart-card",
+            ),
+        ],
+        className="dashboard-container",
+    )
 
     # Callback para cambiar el intervalo de actualización automática (10s / 60s / Pausado)
     @app.callback(
@@ -444,10 +603,13 @@ def create_app(df: pd.DataFrame, data_loader=load_processed_data, default_hours:
                 state["df"] = data_loader(hours)
                 state["hours"] = hours
             except Exception as exc:
+                logger.exception("Error al recargar los datos")
                 status_text = f"Error al actualizar ({datetime.now().strftime('%H:%M:%S')}): {exc}"
 
         base_df = state["df"]
         svc_options = build_service_options(base_df)
+        if selected_service not in {opt["value"] for opt in svc_options}:
+            selected_service = "ALL"
         current_df = (
             base_df
             .pipe(filter_by_service, selected_service)
@@ -465,17 +627,9 @@ def create_app(df: pd.DataFrame, data_loader=load_processed_data, default_hours:
         err_fig = build_error_figure(summary)
 
         r_summary = build_response_time_summary(current_df)
-        r_fig = build_response_time_figure(current_df)
+        r_fig = build_response_time_figure(current_df, hours=hours)
 
-        if not selected_column or selected_column not in current_df.columns:
-            line_fig = px.line(title="Sin datos para mostrar")
-        else:
-            line_fig = px.line(
-                current_df,
-                x=current_df.index,
-                y=selected_column,
-                title=f"Gráfico de {selected_column}",
-            )
+        line_fig = build_column_figure(current_df, selected_column, hours=hours)
 
         return (
             f"{t_summary['avg_rpm']:.1f} RPM",
@@ -499,9 +653,10 @@ def create_app(df: pd.DataFrame, data_loader=load_processed_data, default_hours:
 
 def main():
     default_hours = 24
+    debug = os.getenv("DASH_DEBUG", "0") == "1"
     df = load_processed_data(hours=default_hours)
     app = create_app(df, default_hours=default_hours)
-    app.run(debug=True)
+    app.run(debug=debug, use_reloader=False)
     return df
 
 
